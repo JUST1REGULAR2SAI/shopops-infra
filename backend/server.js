@@ -1,41 +1,287 @@
-import express from 'express'
-import cors from 'cors'
-import archiver from 'archiver'
-import os from 'os'
-import { exec } from 'child_process'
-import fs from 'fs'
-import path from 'path'
+import express         from 'express'
+import cors            from 'cors'
+import archiver        from 'archiver'
+import os              from 'os'
+import { exec }        from 'child_process'
+import fs              from 'fs'
+import path            from 'path'
 import { fileURLToPath } from 'url'
-import autocannon from 'autocannon'
+import autocannon      from 'autocannon'
 
 const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-const TEMP_DIR = path.join(__dirname, 'temp')
+const __dirname  = path.dirname(__filename)
+const TEMP_DIR   = path.join(__dirname, 'temp')
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true })
 
 const app = express()
 app.use(cors())
 app.use(express.json())
 
-const OLLAMA = 'http://localhost:11434/api/generate'
+const OLLAMA = 'http://127.0.0.1:11434/api/generate'
 
-// ── Helper: stream Ollama → collect full response ─────────────────────────
-async function ollama(model, prompt) {
+// ── Helper: stream AI Engine → collect full response ─────────────────────────
+async function askAI(model, prompt, options = {}) {
+  const { format } = options
   const res = await fetch(OLLAMA, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, prompt, stream: false })
+    body: JSON.stringify({
+      model,
+      prompt,
+      stream: false,
+      ...(format ? { format } : {}),
+    })
   })
-  if (!res.ok) throw new Error(`Ollama error: ${res.status}`)
+  if (!res.ok) throw new Error(`AI Engine error: ${res.status}`)
   const data = await res.json()
-  return data.response.trim()
+  return String(data.response || '').trim()
 }
 
 // ── Helper: extract JSON from LLM output safely ───────────────────────────
 function extractJSON(text) {
-  const match = text.match(/\{[\s\S]*\}/)
-  if (!match) throw new Error('No JSON found in response')
-  return JSON.parse(match[0])
+  const source = String(text || '').trim()
+  if (!source) throw new Error('No JSON found in response')
+
+  const parseCandidate = (candidate) => {
+    const value = JSON.parse(candidate)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('Parsed value is not a JSON object')
+    }
+    return value
+  }
+
+  try {
+    return parseCandidate(source)
+  } catch {}
+
+  const fenced = extractCodeFence(source, ['json'])
+  if (fenced) {
+    try {
+      return parseCandidate(fenced)
+    } catch {}
+  }
+
+  const firstBrace = source.indexOf('{')
+  if (firstBrace === -1) throw new Error('No JSON object found in response')
+
+  let depth = 0
+  let inString = false
+  let escaped = false
+
+  for (let i = firstBrace; i < source.length; i += 1) {
+    const ch = source[i]
+
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (ch === '\\') {
+        escaped = true
+      } else if (ch === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+
+    if (ch === '{') depth += 1
+    if (ch === '}') {
+      depth -= 1
+      if (depth === 0) {
+        const candidate = source.slice(firstBrace, i + 1)
+        return parseCandidate(candidate)
+      }
+    }
+  }
+
+  throw new Error('No complete JSON object found in response')
+}
+
+function extractCodeFence(text, preferredLanguages = []) {
+  const source = String(text || '')
+  const normalizedPreferred = preferredLanguages.map(lang => String(lang).toLowerCase())
+  const fencePattern = /```([a-zA-Z0-9_-]*)\s*\n([\s\S]*?)```/g
+  let fallback = ''
+  let match
+
+  while ((match = fencePattern.exec(source)) !== null) {
+    const lang = String(match[1] || '').toLowerCase()
+    const body = String(match[2] || '').trim()
+    if (!body) continue
+    if (!fallback) fallback = body
+    if (
+      normalizedPreferred.includes(lang) ||
+      (normalizedPreferred.includes('yaml') && lang === 'yml') ||
+      (normalizedPreferred.includes('yml') && lang === 'yaml')
+    ) {
+      return body
+    }
+  }
+
+  return fallback
+}
+
+function normalizeGeneratedArtifact(text, kind = 'generic') {
+  let source = String(text || '').replace(/\r\n/g, '\n').trim()
+  if (!source) return ''
+
+  const preferredFenceLanguages = {
+    terraform: ['hcl', 'terraform', 'tf'],
+    dockerfile: ['dockerfile'],
+    pipeline: ['yaml', 'yml'],
+    kubernetes: ['yaml', 'yml'],
+    yaml: ['yaml', 'yml'],
+  }
+
+  const fenced = extractCodeFence(source, preferredFenceLanguages[kind] || [])
+  if (fenced) source = fenced.trim()
+
+  source = source
+    .replace(/^```[a-zA-Z0-9_-]*\s*\n?/, '')
+    .replace(/\n?```$/, '')
+    .trim()
+
+  if (kind === 'terraform') {
+    const start = source.search(/(^|\n)(terraform\s*\{|provider\s+"aws"\s*\{|resource\s+"|data\s+"|variable\s+"|output\s+"|locals\s*\{|module\s+")/m)
+    if (start > 0) source = source.slice(start).trim()
+
+    const lastBrace = source.lastIndexOf('}')
+    if (lastBrace !== -1) source = source.slice(0, lastBrace + 1).trim()
+  }
+
+  if (kind === 'dockerfile') {
+    const lines = source.split('\n')
+    const startIndex = lines.findIndex(line => /^(#|FROM|ARG|RUN|WORKDIR|COPY|ADD|ENV|EXPOSE|CMD|ENTRYPOINT|USER|LABEL|HEALTHCHECK|VOLUME|STOPSIGNAL|SHELL)\b/i.test(line.trim()))
+    if (startIndex > 0) source = lines.slice(startIndex).join('\n').trim()
+  }
+
+  if (kind === 'pipeline' || kind === 'kubernetes' || kind === 'yaml') {
+    const lines = source.split('\n')
+    const startIndex = lines.findIndex(line => /^(name:|on:|jobs:|apiVersion:|kind:|metadata:|---)/.test(line.trim()))
+    if (startIndex > 0) source = lines.slice(startIndex).join('\n').trim()
+  }
+
+  return source
+}
+
+function buildFallbackArchitecture({ bizType = 'custom', traffic = 'small', dataNeeds = 'yes', description = '' }) {
+  const wantsData     = dataNeeds !== 'no'
+  const biggerApp     = traffic === 'medium'
+  const tier          = traffic === 'medium' ? 'Business' : traffic === 'tiny' ? 'Starter' : 'Standard'
+  const estimatedCost = wantsData ? (biggerApp ? 48 : 25) : (biggerApp ? 28 : 15)
+  const loadBalancer  = biggerApp ? 'Application Load Balancer' : null
+  const appServer     = biggerApp ? 'EC2 t3.medium' : 'EC2 t3.micro'
+  const database      = wantsData ? (biggerApp ? 'RDS PostgreSQL Multi-AZ' : 'RDS PostgreSQL t3.micro') : null
+
+  const businessLabel = description
+    ? description.replace(/\s+/g, ' ').trim()
+    : bizType === 'booking'
+      ? 'booking experience'
+      : bizType === 'store'
+        ? 'storefront'
+        : bizType === 'app'
+          ? 'application'
+          : 'website'
+
+  return {
+    tier,
+    components: {
+      cdn: 'AWS CloudFront',
+      loadBalancer,
+      appServer,
+      database,
+      cache: biggerApp && wantsData ? 'ElastiCache Redis' : null,
+      storage: 'S3',
+      monitoring: 'CloudWatch',
+    },
+    estimatedCost,
+    reasoning: `This setup gives your ${businessLabel} a right-sized cloud foundation with room to grow, while keeping cost and complexity under control.`,
+  }
+}
+
+function normalizeRequirementsPayload(raw = {}) {
+  const bizTypeOptions = new Set(['store', 'website', 'app', 'booking', 'custom'])
+  const trafficOptions = new Set(['tiny', 'small', 'medium', 'unsure'])
+  const dataOptions = new Set(['yes', 'no', 'unsure'])
+
+  const bizType = bizTypeOptions.has(raw.bizType) ? raw.bizType : 'custom'
+  const traffic = trafficOptions.has(raw.traffic) ? raw.traffic : 'unsure'
+  const dataNeeds = dataOptions.has(raw.dataNeeds) ? raw.dataNeeds : 'unsure'
+
+  const numericConfidence = Number(raw.confidence)
+  const confidence = Number.isFinite(numericConfidence)
+    ? Math.max(0, Math.min(100, Math.round(numericConfidence)))
+    : 60
+
+  const summary = String(raw.summary || '').trim() || 'Cloud requirements captured from conversation.'
+  const missingInfo = raw.missingInfo == null ? null : String(raw.missingInfo).trim() || null
+
+  return { bizType, traffic, dataNeeds, confidence, summary, missingInfo }
+}
+
+async function generateArchitectureFromContext({ bizType, traffic, dataNeeds, description }) {
+  const userContext = description
+    ? `Business description: "${description}"`
+    : `Business type: ${bizType}, Monthly visitors: ${traffic}, Needs database: ${dataNeeds}`
+
+  const prompt = `You are a senior AWS cloud architect helping a small business owner in India.
+${userContext}
+
+Return ONLY a JSON object (no explanation, no markdown) in this exact format:
+{
+  "tier": "Starter" or "Standard" or "Business",
+  "components": {
+    "cdn": "AWS CloudFront",
+    "loadBalancer": "Application Load Balancer" or null,
+    "appServer": "EC2 t3.micro" or "EC2 t3.medium" or "EC2 Auto Scaling Group",
+    "database": "RDS PostgreSQL t3.micro" or "RDS PostgreSQL Multi-AZ" or null,
+    "cache": "ElastiCache Redis" or null,
+    "storage": "S3",
+    "monitoring": "CloudWatch"
+  },
+  "estimatedCost": <number in USD per month>,
+  "reasoning": "<one plain-English sentence describing what will be built and why, written for a non-technical business owner — no jargon, no AWS terms>"
+}`
+
+  try {
+    const raw = await askAI('llama3', prompt, { format: 'json' })
+    return extractJSON(raw)
+  } catch {
+    return buildFallbackArchitecture({ bizType, traffic, dataNeeds, description })
+  }
+}
+
+async function generateTerraformFromArchitecture(architecture) {
+  if (!architecture?.components) {
+    throw new Error('A valid architecture payload is required before Terraform can be generated.')
+  }
+
+  const c = architecture.components
+  const prompt = `You are a Terraform expert. Generate production-ready AWS Terraform HCL for:
+${JSON.stringify(c, null, 2)}
+
+Rules:
+- AWS provider, region ap-south-1 (Mumbai — best for India)
+- Include VPC with private subnets, security groups with least-privilege rules
+- Enable storage_encrypted=true on all databases
+- Set backup_retention_period=7 on RDS
+- Tags: { Project = "ShopOps", Environment = "production" }
+- Only include resources for components that are NOT null
+- Output ONLY valid HCL, no markdown, no explanation
+- Do not wrap the answer in code fences
+- Do not include any intro or outro sentence
+- Do not use placeholder IDs like sg-xxxxx or subnet-xxxxx
+- Prefer bucket_prefix over undeclared random helper resources
+
+Start with: terraform {`
+
+  const raw = await askAI('deepseek-coder', prompt)
+  const terraform = normalizeGeneratedArtifact(raw, 'terraform')
+  if (!terraform.trim()) throw new Error('Terraform generation returned empty output.')
+  return terraform
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -61,36 +307,13 @@ app.post('/api/architecture', async (req, res) => {
     }})
   }
 
-  const userContext = description
-    ? `Business description: "${description}"`
-    : `Business type: ${bizType}, Monthly visitors: ${traffic}, Needs database: ${dataNeeds}`
-
-  const prompt = `You are a senior AWS cloud architect helping a small business owner in India.
-${userContext}
-
-Return ONLY a JSON object (no explanation, no markdown) in this exact format:
-{
-  "tier": "Starter" or "Standard" or "Business",
-  "components": {
-    "cdn": "AWS CloudFront",
-    "loadBalancer": "Application Load Balancer" or null,
-    "appServer": "EC2 t3.micro" or "EC2 t3.medium" or "EC2 Auto Scaling Group",
-    "database": "RDS PostgreSQL t3.micro" or "RDS PostgreSQL Multi-AZ" or null,
-    "cache": "ElastiCache Redis" or null,
-    "storage": "S3",
-    "monitoring": "CloudWatch"
-  },
-  "estimatedCost": <number in USD per month>,
-  "reasoning": "<one plain-English sentence describing what will be built and why, written for a non-technical business owner — no jargon, no AWS terms>"
-}`
-
   try {
-    const raw = await ollama('llama3', prompt)
-    const arch = extractJSON(raw)
+    const arch = await generateArchitectureFromContext({ bizType, traffic, dataNeeds, description })
     res.json({ ok: true, architecture: arch })
   } catch (err) {
     console.error('Architecture error:', err.message)
-    res.status(500).json({ ok: false, error: err.message })
+    const fallback = buildFallbackArchitecture({ bizType, traffic, dataNeeds, description })
+    res.json({ ok: true, architecture: fallback, degraded: true, warning: 'Using the built-in architecture fallback for this run.' })
   }
 })
 
@@ -102,6 +325,10 @@ Return ONLY a JSON object (no explanation, no markdown) in this exact format:
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api/terraform', async (req, res) => {
   const { architecture } = req.body
+
+  if (!architecture?.components) {
+    return res.status(400).json({ ok: false, error: 'A valid architecture payload is required before Terraform can be generated.' })
+  }
 
   if (req.headers['x-mock'] === '1' || req.query.mock === 'true') {
     return res.json({ ok: true, terraform: `terraform {
@@ -136,29 +363,13 @@ resource "aws_db_instance" "main" {
 }
 
 resource "aws_s3_bucket" "assets" {
-  bucket = "shopops-assets-\${random_id.suffix.hex}"
+  bucket_prefix = "shopops-assets-"
   tags   = { Project = "ShopOps", Environment = "production" }
 }` })
   }
 
-  const c = architecture.components
-
-  const prompt = `You are a Terraform expert. Generate production-ready AWS Terraform HCL for:
-${JSON.stringify(c, null, 2)}
-
-Rules:
-- AWS provider, region ap-south-1 (Mumbai — best for India)
-- Include VPC with private subnets, security groups with least-privilege rules
-- Enable storage_encrypted=true on all databases
-- Set backup_retention_period=7 on RDS
-- Tags: { Project = "ShopOps", Environment = "production" }
-- Only include resources for components that are NOT null
-- Output ONLY valid HCL, no markdown, no explanation
-
-Start with: terraform {`
-
   try {
-    const terraform = await ollama('deepseek-coder', prompt)
+    const terraform = await generateTerraformFromArchitecture(architecture)
     res.json({ ok: true, terraform })
   } catch (err) {
     console.error('Terraform error:', err.message)
@@ -201,7 +412,8 @@ Include health check, non-root user, and .dockerignore-friendly COPY patterns.
 Output ONLY the Dockerfile content, no explanation.`
 
   try {
-    const dockerfile = await ollama('deepseek-coder', prompt)
+    const raw = await askAI('deepseek-coder', prompt)
+    const dockerfile = normalizeGeneratedArtifact(raw, 'dockerfile')
     res.json({ ok: true, dockerfile })
   } catch (err) {
     console.error('Dockerfile error:', err.message)
@@ -212,60 +424,155 @@ Output ONLY the Dockerfile content, no explanation.`
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTE 4: /api/cicd
 // Input:  { bizType }
-// Model:  deepseek-coder
-// Output: { pipeline: "<GitHub Actions YAML>" }
+// Engine: deterministic template
+// Output: { pipeline: "<GitHub Actions YAML with Terraform + Docker + EC2 deploy>" }
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api/cicd', async (req, res) => {
-  const { bizType } = req.body
+  const { bizType = 'application' } = req.body
 
-  if (req.headers['x-mock'] === '1' || req.query.mock === 'true') {
-    return res.json({ ok: true, pipeline: `name: ShopOps — Deploy to AWS
+  const pipeline = `name: ShopOps CI/CD (${bizType})
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  TF_DIR: infrastructure
+  APP_DIR: app
+  IMAGE_NAME: shopops-app
 
 jobs:
-  test:
+  validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-      - run: npm ci
-      - run: npm test
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  build-and-deploy:
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          aws-access-key-id: \${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: \${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-south-1
-      - name: Build and push Docker image
-        run: |
-          docker build -t shopops-app .
-          docker push \${{ secrets.ECR_REGISTRY }}/shopops-app:latest
-      - name: Deploy to EC2
-        run: |
-          ssh -o StrictHostKeyChecking=no ec2-user@\${{ secrets.EC2_HOST }} \\
-            "docker pull && docker-compose up -d"` })
-  }
+          node-version: "20"
 
-  const prompt = `Generate a complete GitHub Actions CI/CD pipeline YAML for a ${bizType} web application.
-Include: lint, test, docker build, push to ECR (region ap-south-1), deploy to EC2 via SSH.
-Output ONLY the YAML content starting with: name:`
+      - name: Install dependencies if package.json exists
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+          else
+            echo "No package.json at repo root, skipping npm ci."
+          fi
 
-  try {
-    const pipeline = await ollama('deepseek-coder', prompt)
-    res.json({ ok: true, pipeline })
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message })
-  }
+      - name: Run tests if script exists
+        run: |
+          if [ -f package.json ] && npm run | grep -q " test"; then
+            npm test
+          else
+            echo "No test script found, skipping tests."
+          fi
+
+      - name: Validate generated folders
+        run: |
+          test -f "$TF_DIR/main.tf" || (echo "Missing infrastructure/main.tf" && exit 1)
+          test -f "$APP_DIR/Dockerfile" || (echo "Missing app/Dockerfile" && exit 1)
+
+  terraform:
+    runs-on: ubuntu-latest
+    needs: validate
+    defaults:
+      run:
+        working-directory: \${{ env.TF_DIR }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: \${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: \${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        run: terraform plan -input=false -no-color -out=tfplan
+
+      - name: Terraform apply (main only)
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -input=false -no-color -auto-approve tfplan
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: terraform
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: \${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: \${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          ECR_REGISTRY: \${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: \${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: \${{ github.sha }}
+        run: |
+          docker build -f "$APP_DIR/Dockerfile" -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" "$APP_DIR"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker tag "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+  deploy-ec2:
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: \${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: \${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Deploy on EC2 host over SSH
+        env:
+          ECR_REGISTRY: \${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: \${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: \${{ github.sha }}
+        run: |
+          echo "\${{ secrets.EC2_SSH_KEY }}" > ec2_key
+          chmod 600 ec2_key
+          ssh -i ec2_key -o StrictHostKeyChecking=no "\${{ secrets.EC2_USER }}@\${{ secrets.EC2_HOST }}" \
+            "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY && \
+             docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG && \
+             docker stop shopops-app || true; docker rm shopops-app || true; \
+             docker run -d --name shopops-app -p 80:80 $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"`
+
+  return res.json({ ok: true, pipeline })
 })
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -399,7 +706,8 @@ Use nginx:alpine as a placeholder image if not specified.
 Output ONLY the YAML content (multiple documents separated by ---), no explanation.`
 
   try {
-    const manifests = await ollama('deepseek-coder', prompt)
+    const raw = await askAI('deepseek-coder', prompt)
+    const manifests = normalizeGeneratedArtifact(raw, 'kubernetes')
     res.json({ ok: true, manifests })
   } catch (err) {
     console.error('Kubernetes error:', err.message)
@@ -439,18 +747,18 @@ Use everyday analogies: a VPC is "a private fenced plot in the cloud", a load ba
   res.setHeader('Access-Control-Allow-Origin', '*')
 
   try {
-    const ollamaRes = await fetch('http://localhost:11434/api/generate', {
+    const aiRes = await fetch('http://127.0.0.1:11434/api/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model, prompt: fullPrompt, stream: true })
     })
 
-    if (!ollamaRes.ok) {
-      res.write(`data: ${JSON.stringify({ error: `Ollama error: ${ollamaRes.status}` })}\n\n`)
+    if (!aiRes.ok) {
+      res.write(`data: ${JSON.stringify({ error: `AI Engine error: ${aiRes.status}` })}\n\n`)
       return res.end()
     }
 
-    const reader = ollamaRes.body.getReader()
+    const reader = aiRes.body.getReader()
     const decoder = new TextDecoder()
 
     while (true) {
@@ -507,9 +815,9 @@ Return ONLY a JSON object with no explanation:
 }`
 
   try {
-    const raw = await ollama('llama3', prompt)
+    const raw = await askAI('llama3', prompt, { format: 'json' })
     const extracted = extractJSON(raw)
-    res.json({ ok: true, requirements: extracted })
+    res.json({ ok: true, requirements: normalizeRequirementsPayload(extracted) })
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message })
   }
@@ -546,7 +854,8 @@ Rules:
 Start with: terraform {`
 
   try {
-    const converted = await ollama('deepseek-coder', prompt)
+    const raw = await askAI('deepseek-coder', prompt)
+    const converted = normalizeGeneratedArtifact(raw, 'terraform')
     res.json({ ok: true, terraform: converted })
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message })
@@ -714,11 +1023,98 @@ app.post('/api/vend/destroy', (req, res) => {
 
 app.get('/api/health', async (_req, res) => {
   try {
-    await fetch('http://localhost:11434/api/tags')
-    res.json({ ok: true, ollama: 'connected', models: ['llama3', 'deepseek-coder'] })
+    await fetch('http://127.0.0.1:11434/api/tags')
+    res.json({ ok: true, ai: 'connected', models: ['llama3', 'deepseek-coder'] })
   } catch {
-    res.status(503).json({ ok: false, ollama: 'disconnected' })
+    res.status(503).json({ ok: false, ai: 'disconnected' })
   }
+})
+
+function buildPromptAwareLocalHealth(query = {}) {
+  const bizType = String(query.bizType || 'custom').toLowerCase()
+  const traffic = String(query.traffic || 'small').toLowerCase()
+  const dataNeeds = String(query.dataNeeds || 'yes').toLowerCase()
+  const description = String(query.description || '').trim()
+  const runId = String(query.runId || '')
+
+  const labelsByBizType = {
+    store: {
+      app: 'Storefront API',
+      queue: 'Order Queue',
+      data: 'Order Ledger',
+      cdn: 'Catalog CDN',
+    },
+    booking: {
+      app: 'Booking Engine',
+      queue: 'Reservation Queue',
+      data: 'Reservation Records',
+      cdn: 'Portal CDN',
+    },
+    app: {
+      app: 'Application API',
+      queue: 'Request Queue',
+      data: 'User Data Store',
+      cdn: 'App Assets CDN',
+    },
+    website: {
+      app: 'Web Server',
+      queue: 'Contact Queue',
+      data: 'Content Store',
+      cdn: 'Content CDN',
+    },
+    custom: {
+      app: 'Business API',
+      queue: 'Work Queue',
+      data: 'Business Data Store',
+      cdn: 'Static Assets CDN',
+    },
+  }
+
+  const labels = labelsByBizType[bizType] || labelsByBizType.custom
+  const promptSeed = `${bizType}|${traffic}|${dataNeeds}|${description}`.length
+  const trafficMultiplier = traffic === 'medium' ? 1.5 : traffic === 'tiny' ? 0.6 : 1
+  const baseCpu = Math.round((18 + (promptSeed % 17)) * trafficMultiplier)
+  const baseMemMb = Math.round((220 + (promptSeed % 280)) * trafficMultiplier)
+  const baseLatency = Math.round((65 + (promptSeed % 45)) * (traffic === 'medium' ? 1.15 : 1))
+
+  return {
+    ok: true,
+    mode: 'dummy-prompt-aware',
+    generatedAt: new Date().toISOString(),
+    context: {
+      bizType,
+      traffic,
+      dataNeeds,
+      prompt: description || `${bizType} app with ${traffic} traffic`,
+      runId: runId || null,
+    },
+    services: {
+      ec2: 'running',
+      s3: 'running',
+      cloudwatch: 'available',
+      sqs: 'available',
+      rds: dataNeeds === 'no' ? 'disabled' : 'running',
+      localstack: 'healthy',
+    },
+    workload: {
+      appService: labels.app,
+      queueService: labels.queue,
+      dataService: labels.data,
+      cdnService: labels.cdn,
+    },
+    metrics: {
+      status: 'healthy',
+      cpuPercent: Math.min(baseCpu, 88),
+      memoryMb: Math.min(baseMemMb, 1024),
+      p95LatencyMs: Math.min(baseLatency, 240),
+      errorRatePercent: Number((0.08 + ((promptSeed % 4) * 0.03)).toFixed(2)),
+    },
+    note: 'This is synthetic health data generated from your prompt for demo purposes.',
+  }
+}
+
+app.get('/api/local-cloud/health', (req, res) => {
+  res.json(buildPromptAwareLocalHealth(req.query || {}))
 })
 
 // ==================== NEW INTEGRATIONS ====================
@@ -799,6 +1195,111 @@ function replaceAwsProviderForLocalstack(terraform = '') {
   return [before, LOCALSTACK_PROVIDER_BLOCK, after].filter(Boolean).join('\n\n')
 }
 
+function buildLocalstackSandboxTerraform(terraform = '', runId = 'sandbox') {
+  const source = String(terraform || '')
+  const safeId = String(runId).replace(/[^a-zA-Z0-9]/g, '').slice(-8) || 'sandbox'
+  const wantsNetwork = /(aws_vpc|aws_instance|aws_security_group|aws_subnet|aws_db_instance)/i.test(source)
+  const wantsStorage = /(aws_s3_bucket|cloudfront|storage)/i.test(source)
+  const wantsMonitoring = /(cloudwatch|monitoring|aws_cloudwatch_log_group)/i.test(source)
+  const wantsSecrets = /(aws_db_instance|secretsmanager|ssm_parameter|encrypted|backup_retention_period)/i.test(source)
+
+  const tags = `tags = {
+  Project     = "ShopOps"
+  Environment = "sandbox"
+}`
+
+  const parts = [
+    `terraform {
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 5.0" }
+  }
+}`,
+    LOCALSTACK_PROVIDER_BLOCK,
+  ]
+
+  if (wantsNetwork) {
+    parts.push(`resource "aws_vpc" "sandbox" {
+  cidr_block           = "10.10.0.0/16"
+  enable_dns_hostnames = true
+  ${tags}
+}`)
+
+    parts.push(`resource "aws_subnet" "app" {
+  vpc_id     = aws_vpc.sandbox.id
+  cidr_block = "10.10.1.0/24"
+  ${tags}
+}`)
+
+    parts.push(`resource "aws_security_group" "app" {
+  name        = "shopops-sandbox-sg-${safeId}"
+  description = "ShopOps local sandbox"
+  vpc_id      = aws_vpc.sandbox.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ${tags}
+}`)
+  }
+
+  if (wantsStorage) {
+    parts.push(`resource "aws_s3_bucket" "assets" {
+  bucket = "shopops-sandbox-assets-${safeId}"
+  ${tags}
+}`)
+  }
+
+  if (wantsSecrets) {
+    parts.push(`resource "aws_s3_bucket" "data_vault" {
+  bucket = "shopops-sandbox-data-${safeId}"
+  ${tags}
+}`)
+  }
+
+  if (wantsMonitoring) {
+    parts.push(`resource "aws_iam_role" "observer" {
+  name = "shopops-sandbox-observer-${safeId}"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+  })
+  ${tags}
+}`)
+  }
+
+  parts.push(`output "sandbox_mode" {
+  value = "localstack-safe-preview"
+}`)
+
+  return parts.join('\n\n').trim() + '\n'
+}
+
+async function applyTerraformInDir(runDir, terraform, env) {
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.writeFileSync(path.join(runDir, 'main.tf'), terraform)
+
+  const initOutput = await runCommand('terraform init -input=false -no-color', { cwd: runDir, env })
+  const applyOutput = await runCommand('terraform apply -auto-approve -input=false -no-color', { cwd: runDir, env })
+  return [mergeCommandOutput(initOutput), mergeCommandOutput(applyOutput)].filter(Boolean).join('\n\n')
+}
+
 function parseMemoryToMB(memUsage = '0MiB / 0MiB') {
   const raw = String(memUsage).split('/')[0]?.trim() || '0MiB'
   const match = raw.match(/([\d.]+)\s*([kmg]i?b)/i)
@@ -863,14 +1364,12 @@ app.post('/api/docker/deploy', async (req, res) => {
     const runDir = path.join(TEMP_DIR, runId)
     fs.mkdirSync(runDir, { recursive: true })
 
-    // Write a simple demo Dockerfile if none provided (for testing)
-    let finalDockerfile = dockerfile
-    if (!finalDockerfile) {
-      finalDockerfile = `FROM nginx:alpine
+    const defaultDockerfile = `FROM nginx:alpine
 RUN echo '<!DOCTYPE html><html><head><title>ShopOps Demo</title></head><body style="font-family:system-ui;padding:20px;background:#FAF7F2"><h1>☁️ ShopOps Demo</h1><p>Container is running!</p></body></html>' > /usr/share/nginx/html/index.html
 EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]`
-    }
+    // Write a simple demo Dockerfile if none provided (for testing)
+    let finalDockerfile = dockerfile || defaultDockerfile
 
     // Also add a simple index.html for good measure
     const indexHtml = `<!DOCTYPE html>
@@ -893,6 +1392,7 @@ CMD ["nginx", "-g", "daemon off;"]`
     if (composeYml) fs.writeFileSync(path.join(runDir, 'docker-compose.yml'), composeYml)
 
     let output = ''
+    let warning = null
     if (composeYml) {
       let composeResult
       try {
@@ -902,14 +1402,22 @@ CMD ["nginx", "-g", "daemon off;"]`
       }
       output = mergeCommandOutput(composeResult)
     } else {
-      const build = await runCommand(`docker build -t ${shellQuote(imageName)} .`, { cwd: runDir })
+      let build
+      try {
+        build = await runCommand(`docker build -t ${shellQuote(imageName)} .`, { cwd: runDir })
+      } catch (buildErr) {
+        // If AI output produced an invalid Dockerfile, fall back to known-good demo image.
+        fs.writeFileSync(path.join(runDir, 'Dockerfile'), defaultDockerfile)
+        warning = `Invalid generated Dockerfile; used fallback demo Dockerfile. Original build error: ${buildErr.error || buildErr.message}`
+        build = await runCommand(`docker build -t ${shellQuote(imageName)} .`, { cwd: runDir })
+      }
       const run = await runCommand(`docker run -d -p ${safePort}:80 --name ${shellQuote(containerName)} ${shellQuote(imageName)}`)
       output = [mergeCommandOutput(build), mergeCommandOutput(run)].filter(Boolean).join('\n\n')
       runtimeState.dockerContainers.add(containerName)
       runtimeState.latestDockerContainer = containerName
     }
 
-    res.json({ ok: true, status: 'running', containerId: runId, containerName, port: safePort, output })
+    res.json({ ok: true, status: 'running', containerId: runId, containerName, port: safePort, output, warning })
   } catch (err) {
     console.error('Docker deploy error:', err)
     const details = mergeCommandOutput(err)
@@ -1021,9 +1529,8 @@ app.post('/api/localstack/deploy', async (req, res) => {
 
     const runId = Date.now().toString()
     const runDir = path.join(TEMP_DIR, `localstack-${runId}`)
-    fs.mkdirSync(runDir, { recursive: true })
-    const localstackTf = replaceAwsProviderForLocalstack(terraform)
-    fs.writeFileSync(path.join(runDir, 'main.tf'), localstackTf)
+    const normalizedTerraform = normalizeGeneratedArtifact(terraform, 'terraform')
+    const localstackTf = replaceAwsProviderForLocalstack(normalizedTerraform)
 
     const env = {
       ...process.env,
@@ -1033,12 +1540,32 @@ app.post('/api/localstack/deploy', async (req, res) => {
       AWS_DEFAULT_REGION: 'ap-south-1',
     }
 
-    const initOutput = await runCommand('terraform init -input=false -no-color', { cwd: runDir, env })
-    const applyOutput = await runCommand('terraform apply -auto-approve -input=false -no-color', { cwd: runDir, env })
-    const output = [mergeCommandOutput(initOutput), mergeCommandOutput(applyOutput)].filter(Boolean).join('\n\n')
+    let output = ''
+    let mode = 'exact'
+    let warning = ''
+    let appliedTerraform = localstackTf
 
-    runtimeState.localstackRuns.set(runId, runDir)
-    res.json({ ok: true, status: 'applied', runId, output })
+    try {
+      output = await applyTerraformInDir(runDir, localstackTf, env)
+    } catch (err) {
+      const fallbackDir = `${runDir}-sandbox`
+      const sandboxTerraform = buildLocalstackSandboxTerraform(normalizedTerraform, runId)
+      output = [
+        'Exact AWS Terraform could not be applied to LocalStack. Falling back to a LocalStack-safe sandbox preview.',
+        mergeCommandOutput(err),
+        await applyTerraformInDir(fallbackDir, sandboxTerraform, env),
+      ].filter(Boolean).join('\n\n')
+      mode = 'sandbox'
+      warning = 'Generated AWS Terraform was translated into a LocalStack-safe sandbox preview for this run.'
+      appliedTerraform = sandboxTerraform
+      runtimeState.localstackRuns.set(runId, fallbackDir)
+    }
+
+    if (!runtimeState.localstackRuns.has(runId)) {
+      runtimeState.localstackRuns.set(runId, runDir)
+    }
+
+    res.json({ ok: true, status: 'applied', runId, mode, warning, terraform: appliedTerraform, output })
   } catch (err) {
     const details = mergeCommandOutput(err)
     res.status(500).json({ ok: false, error: err.error || err.message, details })
@@ -1070,10 +1597,21 @@ app.post('/api/act/run', async (req, res) => {
       event_name: safeEvent,
     }, null, 2))
 
-    const result = await runCommand(
-      `act ${safeEvent} -W ${shellQuote(workflowPath)} -e ${shellQuote(eventPath)}`,
-      { cwd: runDir }
-    )
+    const actCommand = [
+      `act ${safeEvent}`,
+      `-W ${shellQuote(workflowPath)}`,
+      `-e ${shellQuote(eventPath)}`,
+      '--container-architecture linux/amd64',
+      '--container-daemon-socket -',
+      '-P ubuntu-latest=catthehacker/ubuntu:act-latest',
+      '-P ubuntu-22.04=catthehacker/ubuntu:act-22.04',
+      '-P ubuntu-20.04=catthehacker/ubuntu:act-20.04',
+    ].join(' ')
+
+    const result = await runCommand(actCommand, {
+      cwd: runDir,
+      timeout: 15 * 60 * 1000,
+    })
     res.json({ ok: true, status: 'completed', runId, output: mergeCommandOutput(result) })
   } catch (err) {
     const details = mergeCommandOutput(err)
@@ -1395,10 +1933,7 @@ app.post('/api/deploy-all', async (req, res) => {
 // ROUTE: /api/aws/deploy (Deploy to REAL AWS)
 // ══════════════════════════════════════════════════════════════════════════════════
 app.post('/api/aws/deploy', async (req, res) => {
-  const { terraform } = req.body
-  if (!terraform || !terraform.trim()) {
-    return res.status(400).json({ ok: false, error: 'Terraform configuration is required' })
-  }
+  const { terraform, architecture, bizType = 'store', traffic = 'small', dataNeeds = 'yes', description = '' } = req.body
 
   res.setHeader('Content-Type', 'text/event-stream')
   res.setHeader('Cache-Control', 'no-cache')
@@ -1413,8 +1948,37 @@ app.post('/api/aws/deploy', async (req, res) => {
   const runDir = path.join(TEMP_DIR, `aws-${runId}`)
   fs.mkdirSync(runDir, { recursive: true })
 
+  let architectureToUse = architecture
+  let terraformToApply = String(terraform || '').trim()
+
+  if (!architectureToUse?.components && !terraformToApply) {
+    send('aws', 'running', 'Designing architecture from chat context...')
+    try {
+      architectureToUse = await generateArchitectureFromContext({ bizType, traffic, dataNeeds, description })
+      send('aws', 'running', 'Architecture designed')
+    } catch (err) {
+      send('aws', 'error', `Architecture generation failed: ${err.message}`)
+      return res.end()
+    }
+  }
+
+  if (architectureToUse?.components) {
+    send('aws', 'running', 'Generating Terraform from architecture...')
+    try {
+      terraformToApply = await generateTerraformFromArchitecture(architectureToUse)
+    } catch (err) {
+      send('aws', 'error', `Terraform generation failed: ${err.message}`)
+      return res.end()
+    }
+  }
+
+  if (!terraformToApply) {
+    send('aws', 'error', 'Terraform configuration is required')
+    return res.end()
+  }
+
   const tfPath = path.join(runDir, 'main.tf')
-  fs.writeFileSync(tfPath, terraform)
+  fs.writeFileSync(tfPath, terraformToApply)
 
   try {
     send('aws', 'running', 'Initializing Terraform for AWS...')
@@ -1422,6 +1986,11 @@ app.post('/api/aws/deploy', async (req, res) => {
     // terraform init
     const initResult = await runCommand('terraform init -input=false -no-color', { cwd: runDir })
     send('aws', 'running', 'Terraform initialized')
+
+    send('aws', 'running', 'Validating Terraform...')
+    await runCommand('terraform fmt -write=true main.tf', { cwd: runDir })
+    await runCommand('terraform validate -no-color', { cwd: runDir })
+    send('aws', 'running', 'Terraform validated')
 
     // terraform plan
     send('aws', 'running', 'Creating execution plan...')
@@ -1471,10 +2040,11 @@ app.post('/api/aws/destroy', async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════════
 app.get('/api/aws/status', async (req, res) => {
   try {
+    const region = 'ap-south-1'
     const [ec2, s3, rds] = await Promise.all([
-      runCommand('aws ec2 describe-instances --query "Reservations[].Instances[].InstanceId" --output text'),
+      runCommand(`aws ec2 describe-instances --region ${region} --query "Reservations[].Instances[].InstanceId" --output text`),
       runCommand('aws s3 ls'),
-      runCommand('aws rds describe-db-instances --query "DBInstances[].DBInstanceIdentifier" --output text'),
+      runCommand(`aws rds describe-db-instances --region ${region} --query "DBInstances[].DBInstanceIdentifier" --output text`),
     ])
 
     res.json({
@@ -1494,8 +2064,8 @@ app.listen(PORT, () => {
   console.log(`   POST /api/architecture  → llama3 (architecture reasoning)`)
   console.log(`   POST /api/terraform     → deepseek-coder (HCL generation)`)
   console.log(`   POST /api/dockerfile    → deepseek-coder (Docker)`)
-  console.log(`   POST /api/cicd          → deepseek-coder (GitHub Actions)`)
-  console.log(`   GET  /api/health        → Ollama status`)
+  console.log(`   POST /api/cicd          → GitHub Actions template (Terraform + Docker + EC2)`)
+  console.log(`   GET  /api/health        → AI Engine status`)
   console.log(`   🆕 POST /api/docker/deploy    → Run Docker containers`)
   console.log(`   🆕 GET  /api/docker/stats     → Get Docker stats`)
   console.log(`   🆕 POST /api/docker/control   → Control containers`)

@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import ChatOnboarding from './ChatOnboarding'
+import ConsultantExperience from './ConsultantExperience'
+import LocalCloudHealth from './LocalCloudHealth'
 import { Globe, Cloud, Activity, Lock, ShoppingBag, Building2, Smartphone, Calendar, Settings, Server, Database, HardDrive, Monitor, User, Zap, ShieldCheck, RefreshCcw, MessageCircle, Play, Pause, Trash2, BarChart3, ArrowRight, CheckCircle2, AlertTriangle, FileText, HelpCircle } from 'lucide-react'
 import mermaid from 'mermaid'
 // Initialize Mermaid
@@ -159,7 +161,7 @@ const HealthDot = ({ status }) => {
   const cfg = {
     ok:      { cls:'hdot hdot-green', label:'AI ready' },
     slow:    { cls:'hdot hdot-amber', label:'AI warming up — first run may take 20s' },
-    offline: { cls:'hdot hdot-red',   label:'AI offline — run: ollama serve' },
+    offline: { cls:'hdot hdot-red',   label:'AI offline — run: ai-engine start' },
     checking:{ cls:'',                label:'Checking AI…' },
   }[status] || { cls:'', label:'…' }
   return (
@@ -1110,6 +1112,7 @@ function AIGenerator({ bizType, answers }) {
       const terraform=tfData.terraform||'', dockerfile=dfData.dockerfile||'', pipeline=ciData.pipeline||'', kubernetesManifests=k8sData.manifests||''
       const out = {
         terraform, dockerfile, pipeline, kubernetes: kubernetesManifests,
+        architecture: archData.architecture,
         cost: parseCost(terraform), benefits: parseBenefits(terraform),
         secChecks: parseSecurityChecks(terraform),
         tier: archData.architecture?.tier,
@@ -1122,7 +1125,7 @@ function AIGenerator({ bizType, answers }) {
       const hist = [{ id:Date.now(), desc:out.desc, tier:out.tier, cost:out.cost, ts:out.ts }, ...history].slice(0,5)
       setHistory(hist); localStorage.setItem('so_history', JSON.stringify(hist))
     } catch (err) {
-      setError("Couldn't connect — make sure Ollama is running. Open Terminal and run:  ollama serve")
+      setError("Couldn't connect — make sure AI Engine is running. Open Terminal and run:  ai-engine start")
       setGenStep(-1)
     }
   }
@@ -1182,7 +1185,7 @@ function AIGenerator({ bizType, answers }) {
       const data = await res.json()
       const text = data.architecture?.reasoning || data.architecture?.summary || JSON.stringify(data.architecture)
       setExplanation(text)
-    } catch (e) { setExplanation('Could not fetch explanation — make sure Ollama is running.') }
+    } catch (e) { setExplanation('Could not fetch explanation — make sure AI Engine is running.') }
     setExplaining(false)
   }
 
@@ -1633,7 +1636,8 @@ function LocalIntegrationControls({ output, provider }) {
   }
 
   const handleAwsDeploy = async () => {
-    if (!output?.terraform) return alert('No Terraform configuration available')
+    const deployDescription = getDescription()
+    if (!output?.terraform && !deployDescription) return alert('No deployment context available')
     if (!confirm('⚠️ This will deploy REAL resources to your AWS account and may incur charges. Continue?')) return
 
     setAwsState({ running: true, output: null, currentStep: 'Initializing' })
@@ -1642,7 +1646,14 @@ function LocalIntegrationControls({ output, provider }) {
       const res = await fetch(`${API_BASE}/api/aws/deploy`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ terraform: output.terraform })
+        body: JSON.stringify({
+          terraform: output?.terraform || '',
+          architecture: output?.architecture || null,
+          bizType: bizType || 'store',
+          traffic: answers?.traffic || 'small',
+          dataNeeds: answers?.dataNeeds || 'yes',
+          description: deployDescription,
+        })
       })
 
       const reader = res.body.getReader()
@@ -1826,7 +1837,7 @@ function LocalIntegrationControls({ output, provider }) {
               {awsState.running ? `⚡ ${awsState.currentStep || 'Deploying...'}...` : 'Deploy to AWS ⚠️'}
             </button>
             {awsState.output && (
-              <pre style={{ fontSize: '10px', color: '#888', margin: '10px 0 0', maxHeight: 100, overflow: 'auto', color: awsState.output.error ? '#E05A4A' : '#4CAF82' }}>
+              <pre style={{ fontSize: '10px', margin: '10px 0 0', maxHeight: 100, overflow: 'auto', color: awsState.output.error ? '#E05A4A' : '#4CAF82' }}>
                 {awsState.output.error || awsState.output.message || JSON.stringify(awsState.output, null, 2)}
               </pre>
             )}
@@ -2047,7 +2058,7 @@ function Dashboard({ bizType, answers, onReset }) {
       {tab==='chat' && (
         <div className="card" style={{ padding: 20 }}>
           <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 10 }}>
-            <Pill color={C.green}>🟢 Ollama Connected</Pill>
+            <Pill color={C.green}>🟢 AI Engine Connected</Pill>
             <span style={{ fontSize: 12, color: C.muted }}>Running locally on your Mac</span>
           </div>
           <AIChat bizType={bizType} />
@@ -2190,7 +2201,7 @@ const ALL_STEPS = [
 ]
 
 // ─── APP ──────────────────────────────────────────────────────────────────
-export default function App() {
+function LegacyApp() {
   const [step,      setStep]      = useState(() => { try{return parseInt(localStorage.getItem('so_step')||'0',10)}catch{return 0} })
   const [bizType,   setBizType]   = useState(() => localStorage.getItem('so_biz')||null)
   const [traffic,   setTraffic]   = useState(() => localStorage.getItem('so_traffic')||null)
@@ -2388,4 +2399,11 @@ export default function App() {
       <FloatingChat bizType={bizType} />
     </div>
   )
+}
+
+export default function App() {
+  if (typeof window !== 'undefined' && window.location.pathname.startsWith('/local-cloud-health')) {
+    return <LocalCloudHealth />
+  }
+  return <ConsultantExperience />
 }
